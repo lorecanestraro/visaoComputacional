@@ -1,4 +1,4 @@
-#!/home/lorenzocs/Documentos/visaoComputacional/trabalho03/venv/bin/python3
+#!/home/lorenzocs/Documentos/visaoComputacional/trabalho02/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys

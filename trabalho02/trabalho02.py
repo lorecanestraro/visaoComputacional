@@ -1,607 +1,566 @@
+
 import cv2
-import cv2.aruco as aruco
 import numpy as np
 import mediapipe as mp
-import threading
+from mediapipe.tasks import python as _mp_py
+from mediapipe.tasks.python import vision as _mp_vision
+import pygame
+import time
 import sys
 import os
-import math
-import time
-import struct
-import wave
-import tempfile
+from collections import deque
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ÁUDIO – geração de tons sem dependências externas (wave + winsound / pyaudio)
-# ─────────────────────────────────────────────────────────────────────────────
-def _generate_wav_bytes(frequency: float, duration: float = 0.35,
-                         sample_rate: int = 44100, volume: float = 0.5) -> bytes:
-    """Gera um arquivo WAV em memória para a frequência dada."""
-    n_samples = int(sample_rate * duration)
-    buf = bytearray()
-    for i in range(n_samples):
-        t = i / sample_rate
-        # tom com envelope ADSR simples
-        envelope = min(1.0, i / (sample_rate * 0.01))          # attack
-        envelope *= min(1.0, (n_samples - i) / (sample_rate * 0.05))  # release
-        sample = int(32767 * volume * envelope * math.sin(2 * math.pi * frequency * t))
-        buf += struct.pack('<h', sample)
-    # monta WAV
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-        fname = f.name
-    with wave.open(fname, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(bytes(buf))
-    return fname
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk   # pip install Pillow
 
+# ──────────────────────────────────────────────
+# Calibração da câmera
+# ──────────────────────────────────────────────
+CALIB_PATH = r"calibracao\calibracao_webcam_casa.npz"
+try:
+    _c = np.load(CALIB_PATH)
+    CAM_MTX  = _c["mtx"].astype(np.float64)
+    CAM_DIST = _c["dist"].astype(np.float64)
+    CALIB_STATUS = "✔ Calibração carregada"
+except Exception:
+    CAM_MTX  = np.array([[650,0,320],[0,650,240],[0,0,1]], dtype=np.float64)
+    CAM_DIST = np.zeros((1,5), dtype=np.float64)
+    CALIB_STATUS = "⚠ Valores padrão (sem calibração)"
 
-def play_tone(frequency: float):
-    """Toca um tom em thread separada (não bloqueia o loop de vídeo)."""
-    def _play():
-        fname = _generate_wav_bytes(frequency)
-        try:
-            if sys.platform == 'win32':
-                import winsound
-                winsound.PlaySound(fname, winsound.SND_FILENAME)
-            else:
-                os.system(f'aplay -q "{fname}" 2>/dev/null || '
-                          f'afplay "{fname}" 2>/dev/null || '
-                          f'ffplay -nodisp -autoexit -loglevel quiet "{fname}" 2>/dev/null')
-        finally:
-            try:
-                os.unlink(fname)
-            except Exception:
-                pass
-    threading.Thread(target=_play, daemon=True).start()
+# ──────────────────────────────────────────────
+# ArUco
+# ──────────────────────────────────────────────
+ARUCO_DICT     = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+ARUCO_PARAMS   = cv2.aruco.DetectorParameters()
+ARUCO_DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+MARKER_SIZE_M  = 0.06
 
+# ──────────────────────────────────────────────
+# Áudio — Ocarina
+# ──────────────────────────────────────────────
+pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+SAMPLE_RATE = 44100
 
-# Notas da escala pentatônica de Dó (oito orifícios da ocarina clássica)
-OCARINA_NOTES = {
-    0: ('C4',  261.63),
-    1: ('D4',  293.66),
-    2: ('E4',  329.63),
-    3: ('G4',  392.00),
-    4: ('A4',  440.00),
-    5: ('C5',  523.25),
-    6: ('D5',  587.33),
-    7: ('E5',  659.25),
+NOTE_FREQS  = {1:261.63,2:293.66,3:329.63,4:349.23,5:392.00,6:440.00,7:493.88}
+NOTE_NAMES  = {1:"Dó",2:"Ré",3:"Mi",4:"Fá",5:"Sol",6:"Lá",7:"Si"}
+NOTE_COLORS_CV = {
+    1:(255,80,80),2:(255,160,60),3:(255,220,0),
+    4:(80,200,80),5:(60,180,255),6:(140,80,255),7:(255,80,200),
+}
+NOTE_COLORS_HEX = {
+    1:"#ff5050",2:"#ffa03c",3:"#ffdc00",
+    4:"#50c850",5:"#3cb4ff",6:"#8c50ff",7:"#ff50c8",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CÂMERA
-# ─────────────────────────────────────────────────────────────────────────────
-def open_camera(index: int = 0) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        print(f"[ERRO] Não foi possível abrir a câmera {index}.")
-        sys.exit(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
-    return cap
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DETECTOR ArUco
-# ─────────────────────────────────────────────────────────────────────────────
-ARUCO_DICT  = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-ARUCO_PARAMS = aruco.DetectorParameters()
-ARUCO_DETECTOR = aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
-
-
-def detect_aruco(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = ARUCO_DETECTOR.detectMarkers(gray)
-    return corners, ids
-
-
-def marker_center(corners_single):
-    """Retorna o centro (x, y) de um marcador."""
-    c = corners_single[0]
-    return (int(c[:, 0].mean()), int(c[:, 1].mean()))
-
-
-def marker_size_px(corners_single):
-    """Retorna o tamanho médio do marcador em pixels."""
-    c = corners_single[0]
-    w = np.linalg.norm(c[0] - c[1])
-    h = np.linalg.norm(c[1] - c[2])
-    return (w + h) / 2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MÓDULO (3a) – METROLOGIA
-# ─────────────────────────────────────────────────────────────────────────────
-MARKER_REAL_CM = 4.0          # tamanho REAL do marcador em cm (ajuste conforme necessário)
-REF_MARKER_IDS = [0, 1]       # IDs dos dois marcadores de referência
-
-
-def run_metrologia(cap: cv2.VideoCapture):
-    print("\n[Metrologia] Posicione os marcadores ArUco ID=0 e ID=1 em frente à câmera.")
-    print("  Defina o tamanho real do marcador: ", end='')
+def _make_sound(freq, duration=0.4):
+    t = np.linspace(0, duration, int(SAMPLE_RATE*duration), endpoint=False)
+    wave = np.sin(2*np.pi*freq*t) * np.linspace(1.0,0.0,int(SAMPLE_RATE*duration))
+    mono = (wave*32767).astype(np.int16)
+    stereo = np.column_stack([mono, mono])
     try:
-        size_input = float(input(f"({MARKER_REAL_CM} cm) > ").strip() or MARKER_REAL_CM)
+        return pygame.sndarray.make_sound(stereo)
     except ValueError:
-        size_input = MARKER_REAL_CM
+        return pygame.sndarray.make_sound(mono)
 
-    win = "Metrologia ArUco | Q = sair"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+_sound_cache = {nid: _make_sound(freq) for nid, freq in NOTE_FREQS.items()}
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.flip(frame, 1)
-        corners, ids = detect_aruco(frame)
-        aruco.drawDetectedMarkers(frame, corners, ids)
+# ──────────────────────────────────────────────
+# MediaPipe Hands
+# ──────────────────────────────────────────────
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+_mp_base_opts = _mp_py.BaseOptions(model_asset_path=_MODEL_PATH)
+_mp_hand_opts = _mp_vision.HandLandmarkerOptions(
+    base_options=_mp_base_opts,
+    running_mode=_mp_vision.RunningMode.VIDEO,
+    num_hands=3,
+    min_hand_detection_confidence=0.6,
+    min_hand_presence_confidence=0.6,
+    min_tracking_confidence=0.6,
+)
+_hands_model  = _mp_vision.HandLandmarker.create_from_options(_mp_hand_opts)
+_mp_frame_ts  = 0
 
-        info_lines = ["IDs detectados: " + (str(ids.flatten().tolist()) if ids is not None else "nenhum")]
-
-        if ids is not None and len(ids) >= 2:
-            id_map = {int(ids[i]): corners[i] for i in range(len(ids))}
-            if REF_MARKER_IDS[0] in id_map and REF_MARKER_IDS[1] in id_map:
-                c0 = id_map[REF_MARKER_IDS[0]]
-                c1 = id_map[REF_MARKER_IDS[1]]
-
-                # calibração de escala px/cm via tamanho do marcador
-                px_per_cm = marker_size_px(c0) / size_input
-
-                center0 = marker_center(c0)
-                center1 = marker_center(c1)
-                dist_px = math.dist(center0, center1)
-                dist_cm = dist_px / px_per_cm
-
-                cv2.line(frame, center0, center1, (0, 255, 0), 2)
-                mid = ((center0[0]+center1[0])//2, (center0[1]+center1[1])//2)
-                cv2.putText(frame, f"{dist_cm:.1f} cm", (mid[0]+10, mid[1]-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                info_lines.append(f"Distancia ID0-ID1: {dist_cm:.1f} cm  ({dist_px:.0f} px)")
-
-        # HUD
-        for i, txt in enumerate(info_lines):
-            cv2.putText(frame, txt, (10, 30 + 30*i),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 220, 0), 2)
-
-        cv2.imshow(win, frame)
-        if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
-            break
-
-    cv2.destroyWindow(win)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MÓDULO (3b) – OCARINA
-# ─────────────────────────────────────────────────────────────────────────────
-# Mapeamento: ID 10 = corpo/referência da ocarina; IDs 11-18 = orifícios
-OCARINA_REF_ID   = 10
-OCARINA_HOLE_IDS = [11, 12, 13, 14, 15, 16, 17, 18]   # até 8 orifícios
-
-COOLDOWN_S = 0.4   # intervalo mínimo entre sons do mesmo orifício
-
-
-def _draw_ocarina_3d(frame, ref_corners, holes_covered: dict):
-    """
-    Desenha uma ocarina 3D simplificada sobre o marcador de referência.
-    A posição/escala segue o marcador ArUco de referência.
-    """
-    c = ref_corners[0]   # 4 pontos do marcador
-
-    # Vetores de perspectiva a partir dos cantos do marcador
-    tl = c[0].astype(float)
-    tr = c[1].astype(float)
-    br = c[2].astype(float)
-    bl = c[3].astype(float)
-
-    def lerp(a, b, t):
-        return a + t * (b - a)
-
-    # ----- corpo da ocarina (elipse perspectivada via polígono) -----
-    body_pts = []
-    for t in np.linspace(0, 1, 40):
-        angle = 2 * math.pi * t
-        u = 0.5 + 1.4 * math.cos(angle)   # exagerado para parecer ovalado
-        v = 0.5 + 0.55 * math.sin(angle)
-        u = max(0, min(1, u)) if False else u   # sem clip – perspectiva livre
-        pt = lerp(lerp(tl, tr, u), lerp(bl, br, u), v)
-        body_pts.append(pt)
-    body_pts = np.array(body_pts, dtype=np.int32)
-
-    # sombra / profundidade
-    shadow = body_pts + np.array([6, 6])
-    cv2.fillPoly(frame, [shadow], (30, 20, 10))
-    # corpo principal – gradiente simulado com dois polígonos
-    cv2.fillPoly(frame, [body_pts], (30, 80, 160))
-    # brilho superior
-    highlight_pts = []
-    for t in np.linspace(0, 1, 30):
-        angle = math.pi + math.pi * t  # metade superior
-        u = 0.5 + 1.3 * math.cos(angle)
-        v = 0.5 + 0.45 * math.sin(angle)
-        pt = lerp(lerp(tl, tr, u), lerp(bl, br, u), v)
-        highlight_pts.append(pt)
-    cv2.polylines(frame, [np.array(highlight_pts, dtype=np.int32)], False, (120, 180, 255), 3)
-
-    # bocal (tubo pequeno à direita)
-    mouthpiece_start = lerp(lerp(tl, tr, 1.5), lerp(bl, br, 1.5), 0.5)
-    mouthpiece_end   = lerp(lerp(tl, tr, 1.9), lerp(bl, br, 1.9), 0.5)
-    cv2.line(frame,
-             tuple(mouthpiece_start.astype(int)),
-             tuple(mouthpiece_end.astype(int)),
-             (20, 60, 130), 12)
-    cv2.circle(frame, tuple(mouthpiece_end.astype(int)), 6, (100, 160, 220), -1)
-
-    # ----- orifícios -----
-    n_holes = len(OCARINA_HOLE_IDS)
-    for i in range(n_holes):
-        t_u = 0.2 + 0.6 * (i / max(n_holes - 1, 1))
-        t_v = 0.5
-        hole_center = lerp(lerp(tl, tr, t_u), lerp(bl, br, t_u), t_v)
-        hid = OCARINA_HOLE_IDS[i]
-        covered = holes_covered.get(hid, False)
-        color   = (0, 20, 60) if covered else (180, 220, 255)
-        cv2.circle(frame, tuple(hole_center.astype(int)), 10, color, -1)
-        cv2.circle(frame, tuple(hole_center.astype(int)), 10, (0, 40, 100), 2)
-        # nome da nota
-        note_name = OCARINA_NOTES.get(i, ('?', 0))[0]
-        cv2.putText(frame, note_name,
-                    (int(hole_center[0]) - 12, int(hole_center[1]) + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 255), 1)
-
-
-def run_ocarina(cap: cv2.VideoCapture):
-    print("\n[Ocarina] Marcadores necessários:")
-    print(f"  ID {OCARINA_REF_ID} = corpo da ocarina (referência)")
-    for i, hid in enumerate(OCARINA_HOLE_IDS):
-        note = OCARINA_NOTES[i][0]
-        print(f"  ID {hid} = orifício {i+1} → nota {note}")
-    print("Cubra cada marcador de orifício com o dedo para tocar a nota.")
-    print("Q = sair\n")
-
-    win = "Ocarina Virtual | Q = sair"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-
-    last_played  = {}   # hid → timestamp
-    was_covered  = {}   # hid → bool (estado anterior)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.flip(frame, 1)
-        corners, ids = detect_aruco(frame)
-
-        id_map = {}
-        if ids is not None:
-            for i in range(len(ids)):
-                id_map[int(ids[i])] = corners[i]
-
-        holes_covered = {}
-        for hid in OCARINA_HOLE_IDS:
-            holes_covered[hid] = (hid not in id_map)   # coberto = não detectado
-
-        # Desenha ocarina se marcador de referência visível
-        if OCARINA_REF_ID in id_map:
-            _draw_ocarina_3d(frame, id_map[OCARINA_REF_ID], holes_covered)
-        else:
-            cv2.putText(frame, f"Mostre marcador ID={OCARINA_REF_ID} (corpo)",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-
-        # Toca sons ao cobrir orifícios
-        now = time.time()
-        for i, hid in enumerate(OCARINA_HOLE_IDS):
-            covered = holes_covered[hid]
-            prev    = was_covered.get(hid, False)
-            if covered and not prev:   # borda de descida (acabou de cobrir)
-                last_t = last_played.get(hid, 0)
-                if now - last_t > COOLDOWN_S:
-                    freq = OCARINA_NOTES[i][1]
-                    play_tone(freq)
-                    last_played[hid] = now
-            was_covered[hid] = covered
-
-        aruco.drawDetectedMarkers(frame, corners, ids)
-
-        # HUD de status dos orifícios
-        for i, hid in enumerate(OCARINA_HOLE_IDS):
-            note  = OCARINA_NOTES[i][0]
-            state = "●" if holes_covered[hid] else "○"
-            color = (0, 80, 255) if holes_covered[hid] else (180, 180, 180)
-            cv2.putText(frame, f"{state} {note}", (10, 30 + 28*i),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-
-        cv2.imshow(win, frame)
-        if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
-            break
-
-    cv2.destroyWindow(win)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MÓDULO (3c) – REALIDADE VIRTUAL SEM MARCADORES (MediaPipe + objeto 3D)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Compatibilidade: tenta API nova (0.10+), cai para API legada se necessário
-try:
-    from mediapipe.tasks import python as mp_tasks
-    from mediapipe.tasks.python import vision as mp_vision
-    from mediapipe.tasks.python.vision import HandLandmarkerOptions
-    _MP_NEW_API = True
-except Exception:
-    _MP_NEW_API = False
-
-# Conexões dos dedos para desenhar o esqueleto manualmente
-HAND_CONNECTIONS = [
-    (0,1),(1,2),(2,3),(3,4),       # polegar
-    (0,5),(5,6),(6,7),(7,8),       # indicador
-    (0,9),(9,10),(10,11),(11,12),  # médio
-    (0,13),(13,14),(14,15),(15,16),# anelar
-    (0,17),(17,18),(18,19),(19,20),# mínimo
-    (5,9),(9,13),(13,17),          # metacarpo
+_HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+    (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
+    (13,17),(17,18),(18,19),(19,20),(0,17),
 ]
 
+# ──────────────────────────────────────────────
+# Helpers de desenho (OpenCV)
+# ──────────────────────────────────────────────
+FONT    = cv2.FONT_HERSHEY_SIMPLEX
+C_W     = (255,255,255); C_BLK=(0,0,0)
+C_YEL   = (0,220,255);   C_GRN=(0,220,80)
+C_CYN   = (255,200,0)
 
-def _draw_hand_skeleton(frame, landmarks, w, h):
-    """Desenha o esqueleto da mão a partir de uma lista de NormalizedLandmark."""
-    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (0, 120, 255), 2)
-    for pt in pts:
-        cv2.circle(frame, pt, 4, (0, 200, 100), -1)
+def put_text(img, text, pos, scale=0.6, color=C_W, thickness=1, bg=True):
+    (tw,th),bl = cv2.getTextSize(text, FONT, scale, thickness)
+    x,y = pos
+    if bg:
+        cv2.rectangle(img,(x-2,y-th-bl-2),(x+tw+2,y+2),C_BLK,-1)
+    cv2.putText(img,text,(x,y),FONT,scale,color,thickness,cv2.LINE_AA)
 
+def draw_axes(img, rvec, tvec, length=0.03):
+    pts,_ = cv2.projectPoints(
+        np.float32([[0,0,0],[length,0,0],[0,length,0],[0,0,-length]]),
+        rvec, tvec, CAM_MTX, CAM_DIST)
+    pts = pts.reshape(-1,2).astype(int)
+    cv2.arrowedLine(img,tuple(pts[0]),tuple(pts[1]),(0,0,255),2,tipLength=0.3)
+    cv2.arrowedLine(img,tuple(pts[0]),tuple(pts[2]),(0,255,0),2,tipLength=0.3)
+    cv2.arrowedLine(img,tuple(pts[0]),tuple(pts[3]),(255,0,0),2,tipLength=0.3)
 
-def _palm_center_from_list(landmarks, w, h):
-    palm_ids = [0, 1, 5, 9, 13, 17]
-    xs = [landmarks[i].x for i in palm_ids]
-    ys = [landmarks[i].y for i in palm_ids]
-    return int(np.mean(xs) * w), int(np.mean(ys) * h)
+def _marker_center(corners):
+    return corners[0].reshape(-1,2).mean(axis=0)
 
+def _pose_from_corners(corners):
+    obj_pts = np.array([
+        [-MARKER_SIZE_M/2, MARKER_SIZE_M/2,0],
+        [ MARKER_SIZE_M/2, MARKER_SIZE_M/2,0],
+        [ MARKER_SIZE_M/2,-MARKER_SIZE_M/2,0],
+        [-MARKER_SIZE_M/2,-MARKER_SIZE_M/2,0],
+    ], dtype=np.float64)
+    img_pts = corners[0].astype(np.float64)
+    ok,rvec,tvec = cv2.solvePnP(obj_pts,img_pts,CAM_MTX,CAM_DIST,
+                                 flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    return (rvec,tvec) if ok else (None,None)
 
-def _palm_radius_from_list(landmarks, w, h):
-    wrist = landmarks[0]
-    mid   = landmarks[9]
-    dx = (mid.x - wrist.x) * w
-    dy = (mid.y - wrist.y) * h
-    return max(20, int(math.hypot(dx, dy) * 0.6))
+# ══════════════════════════════════════════════
+# MODO 1 — METROLOGIA
+# ══════════════════════════════════════════════
+_metro_history = deque(maxlen=15)
 
+def process_metrology(frame, app):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = ARUCO_DETECTOR.detectMarkers(gray)
+    out = frame.copy()
+    info_lines = []
 
-def _draw_3d_sphere(frame, cx, cy, radius, t):
-    """
-    Desenha uma esfera 3D animada com sombreamento Phong simplificado.
-    t = tempo para animação de rotação.
-    """
-    if radius < 5:
-        return
-
-    # Sombra no chão
-    shadow_a = int(radius * 1.3)
-    shadow_b = int(radius * 0.4)
-    overlay = frame.copy()
-    cv2.ellipse(overlay, (cx, cy + radius + shadow_b),
-                (shadow_a, shadow_b), 0, 0, 360, (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-
-    # Corpo da esfera (gradiente radial simulado com círculos concêntricos)
-    steps = 20
-    for s in range(steps, 0, -1):
-        ratio = s / steps
-        r_step = int(radius * ratio)
-        # interpolação de cor: centro brilhante → borda escura
-        # cor base: azul-ciano animado
-        hue = (int(t * 30) + int(ratio * 60)) % 180
-        hsv_color = np.uint8([[[hue, 220, int(255 * ratio)]]])
-        bgr = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
-        color = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
-        # offset de luz (simula fonte de luz no canto superior esquerdo)
-        lx = cx - int(radius * 0.3)
-        ly = cy - int(radius * 0.3)
-        cv2.circle(frame, (lx + int((cx-lx)*(1-ratio)),
-                           ly + int((cy-ly)*(1-ratio))),
-                   r_step, color, -1)
-
-    # Especular
-    spec_x = cx - int(radius * 0.35)
-    spec_y = cy - int(radius * 0.35)
-    cv2.circle(frame, (spec_x, spec_y), max(2, radius // 6), (240, 240, 255), -1)
-    cv2.circle(frame, (spec_x - 4, spec_y - 4), max(1, radius // 12), (255, 255, 255), -1)
-
-    # Anel orbital animado (rotação)
-    angle_deg = (t * 90) % 360
-    ring_pts = []
-    for deg in range(0, 360, 10):
-        rad = math.radians(deg)
-        rx  = math.cos(rad) * radius
-        ry  = math.sin(rad) * radius * 0.3
-        # rotação
-        a2  = math.radians(angle_deg)
-        rx2 = rx * math.cos(a2) - ry * math.sin(a2)
-        ry2 = rx * math.sin(a2) + ry * math.cos(a2)
-        ring_pts.append((cx + int(rx2), cy + int(ry2 * 0.5)))
-    ring_pts = np.array(ring_pts, dtype=np.int32)
-    cv2.polylines(frame, [ring_pts], True, (0, 220, 255), 2)
-
-    # Segundo anel (perpendicular)
-    ring2 = []
-    for deg in range(0, 360, 10):
-        rad = math.radians(deg)
-        rx  = math.cos(rad) * radius * 0.3
-        ry  = math.sin(rad) * radius
-        a2  = math.radians(angle_deg + 90)
-        rx2 = rx * math.cos(a2) - ry * math.sin(a2)
-        ry2 = rx * math.sin(a2) + ry * math.cos(a2)
-        ring2.append((cx + int(rx2 * 0.5), cy + int(ry2)))
-    ring2 = np.array(ring2, dtype=np.int32)
-    cv2.polylines(frame, [ring2], True, (255, 180, 0), 2)
-
-
-def _run_ar_hand_legacy(cap, win):
-    """Usa mediapipe.solutions.hands (API legada, versões < 0.10)."""
-    mp_hands_mod = mp.solutions.hands
-    mp_drawing   = mp.solutions.drawing_utils
-
-    with mp_hands_mod.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.5,
-    ) as hands:
-        t0 = time.time()
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.flip(frame, 1)
-            h, w  = frame.shape[:2]
-            t     = time.time() - t0
-
-            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
-
-            if results.multi_hand_landmarks:
-                for hl in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame, hl, mp_hands_mod.HAND_CONNECTIONS,
-                        mp_drawing.DrawingSpec(color=(0,200,100), thickness=2, circle_radius=3),
-                        mp_drawing.DrawingSpec(color=(0,120,255), thickness=2),
-                    )
-                    lms = hl.landmark
-                    cx, cy = _palm_center_from_list(lms, w, h)
-                    radius = _palm_radius_from_list(lms, w, h)
-                    _draw_3d_sphere(frame, cx, cy, radius, t)
-            else:
-                cv2.putText(frame, "Mostre sua mao para a camera",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,200,255), 2)
-
-            cv2.putText(frame, "AR Sem Marcadores – Esfera 3D na Palma",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,220,0), 2)
-            cv2.imshow(win, frame)
-            if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
-                break
-
-
-def _run_ar_hand_new(cap, win):
-    """Usa mediapipe.tasks (API nova, versões >= 0.10)."""
-    import mediapipe as mp2
-    BaseOptions   = mp2.tasks.BaseOptions
-    HandLandmarker        = mp2.tasks.vision.HandLandmarker
-    HandLandmarkerOptions = mp2.tasks.vision.HandLandmarkerOptions
-    VisionRunningMode     = mp2.tasks.vision.RunningMode
-
-    # Baixa o modelo se necessário
-    model_path = os.path.join(tempfile.gettempdir(), "hand_landmarker.task")
-    if not os.path.exists(model_path):
-        print("  Baixando modelo HandLandmarker (~8 MB)...", end=' ', flush=True)
-        import urllib.request
-        url = ("https://storage.googleapis.com/mediapipe-models/"
-               "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
-        try:
-            urllib.request.urlretrieve(url, model_path)
-            print("OK")
-        except Exception as e:
-            print(f"\n  [ERRO] Falha ao baixar modelo: {e}")
-            print("  Certifique-se de ter conexão com a internet e tente novamente.")
-            return
-
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=VisionRunningMode.IMAGE,
-        num_hands=2,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-
-    t0 = time.time()
-    with HandLandmarker.create_from_options(options) as detector:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.flip(frame, 1)
-            h, w  = frame.shape[:2]
-            t     = time.time() - t0
-
-            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp2.Image(image_format=mp2.ImageFormat.SRGB, data=rgb)
-            result   = detector.detect(mp_image)
-
-            if result.hand_landmarks:
-                for lms in result.hand_landmarks:
-                    _draw_hand_skeleton(frame, lms, w, h)
-                    cx, cy = _palm_center_from_list(lms, w, h)
-                    radius = _palm_radius_from_list(lms, w, h)
-                    _draw_3d_sphere(frame, cx, cy, radius, t)
-            else:
-                cv2.putText(frame, "Mostre sua mao para a camera",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,200,255), 2)
-
-            cv2.putText(frame, "AR Sem Marcadores – Esfera 3D na Palma",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,220,0), 2)
-            cv2.imshow(win, frame)
-            if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
-                break
-
-
-def run_ar_hand(cap: cv2.VideoCapture):
-    print("\n[AR sem marcadores] Mostre sua mão para a câmera.")
-    print("O objeto 3D aparecerá no centro da palma. Q = sair\n")
-
-    win = "AR Mão | Q = sair"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-
-    # Detecta qual API do MediaPipe está disponível
-    has_solutions = hasattr(mp, 'solutions') and hasattr(mp.solutions, 'hands')
-    if has_solutions:
-        print("  [MediaPipe] Usando API legada (mp.solutions.hands)")
-        _run_ar_hand_legacy(cap, win)
+    if ids is not None and len(ids) >= 2:
+        cv2.aruco.drawDetectedMarkers(out, corners, ids)
+        tvecs = []
+        for c, mid in zip(corners, ids.flatten()):
+            rvec,tvec = _pose_from_corners([c])
+            if tvec is not None:
+                draw_axes(out, rvec, tvec)
+                tvecs.append(tvec.flatten())
+                ctr = _marker_center([c]).astype(int)
+                put_text(out, f"ID:{mid}", (int(ctr[0]),int(ctr[1])+30),
+                         scale=0.55, color=C_CYN)
+        if len(tvecs) >= 2:
+            dist_m = float(np.linalg.norm(tvecs[0]-tvecs[1]))
+            _metro_history.append(dist_m)
+            smooth = float(np.mean(_metro_history))
+            info_lines.append(f"Distância: {smooth*100:.1f} cm  ({smooth*1000:.0f} mm)")
+            c0 = _marker_center([corners[0]]).astype(int)
+            c1 = _marker_center([corners[1]]).astype(int)
+            cv2.line(out, tuple(c0), tuple(c1), C_GRN, 2)
+            mid_px = ((c0+c1)/2).astype(int)
+            put_text(out, f"{smooth*100:.1f} cm",
+                     (int(mid_px[0]),int(mid_px[1])-15), scale=0.75, color=C_GRN)
+            app.set_status(f"📏 {smooth*100:.1f} cm | {smooth*1000:.0f} mm")
+    elif ids is not None and len(ids)==1:
+        cv2.aruco.drawDetectedMarkers(out, corners, ids)
+        rvec,tvec = _pose_from_corners([corners[0]])
+        if tvec is not None:
+            draw_axes(out, rvec, tvec)
+            z = float(tvec.flatten()[2])
+            info_lines.append(f"Distância ao marcador: {z*100:.1f} cm")
+            app.set_status(f"1 marcador — {z*100:.1f} cm")
+        info_lines.append("Mostre 2 marcadores para medir distância")
     else:
-        print("  [MediaPipe] Usando API nova (mediapipe.tasks)")
-        _run_ar_hand_new(cap, win)
+        _metro_history.clear()
+        info_lines.append("Nenhum marcador detectado")
+        app.set_status("Aguardando marcadores ArUco…")
 
-    cv2.destroyWindow(win)
+    for i, line in enumerate(info_lines):
+        put_text(out, line, (10, 30+i*28), scale=0.6, color=C_YEL)
+    return out
 
+# ══════════════════════════════════════════════
+# MODO 2 — OCARINA VIRTUAL
+# ══════════════════════════════════════════════
+OCARINA_BODY_ID = 0
+OCARINA_HOLE_IDS = [1,2,3,4,5,6,7]
+_note_playing: dict = {}
+_NOTE_COOLDOWN = 0.5
+_hole_absent: dict = {i:0 for i in OCARINA_HOLE_IDS}
+_ABSENT_THRESHOLD = 5
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MENU PRINCIPAL
-# ─────────────────────────────────────────────────────────────────────────────
-BANNER = r"""
-╔══════════════════════════════════════════════════════════╗
-║     TRABALHO PRÁTICO 2 – VISÃO COMPUTACIONAL             ║
-║     UNICENTRO  •  Prof. Dr. Mauro Miazaki                ║
-╠══════════════════════════════════════════════════════════╣
-║  [1]  Metrologia ArUco  (distância entre marcadores)     ║
-║  [2]  Ocarina Virtual   (tocar notas cobrindo ArUco)     ║
-║  [3]  AR sem marcadores (esfera 3D na palma – MediaPipe) ║
-║  [0]  Sair                                               ║
-╚══════════════════════════════════════════════════════════╝
-"""
+def _draw_ocarina_body(out, body_corners, body_rvec, body_tvec, hole_states):
+    W,H,D = 0.14,0.06,0.0
+    pts3d = np.float32([[-W/2,-H/2,D],[W/2,-H/2,D],[W/2,H/2,D],[-W/2,H/2,D]])
+    pts2d,_ = cv2.projectPoints(pts3d, body_rvec, body_tvec, CAM_MTX, CAM_DIST)
+    pts2d = pts2d.reshape(-1,2).astype(int)
+    cv2.fillConvexPoly(out, pts2d, (50,140,200))
+    cv2.polylines(out, [pts2d], True, (200,220,255), 2)
+    xs = np.linspace(-0.40*W, 0.40*W, 7)
+    for i, hid in enumerate(OCARINA_HOLE_IDS):
+        hpt,_ = cv2.projectPoints(np.float32([[xs[i],0,D]]),
+                                   body_rvec, body_tvec, CAM_MTX, CAM_DIST)
+        hp = tuple(hpt.reshape(2).astype(int))
+        covered = hole_states.get(hid, False)
+        fill = NOTE_COLORS_CV[hid] if covered else (20,20,20)
+        cv2.circle(out, hp, 8, fill, -1)
+        cv2.circle(out, hp, 8, (220,220,220), 1)
+        if covered:
+            put_text(out, NOTE_NAMES[hid], (hp[0]-10,hp[1]-16),
+                     scale=0.4, color=NOTE_COLORS_CV[hid], bg=False)
 
+def process_ocarina(frame, app):
+    global _hole_absent, _note_playing
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = ARUCO_DETECTOR.detectMarkers(gray)
+    out = frame.copy()
+    now = time.time()
+    detected_ids = set(ids.flatten().tolist()) if ids is not None else set()
 
-def main():
-    print(BANNER)
-    print("Abrindo câmera...", end=' ', flush=True)
-    cap = open_camera(0)
-    print("OK")
-
-    while True:
-        print(BANNER)
-        choice = input("Escolha uma opção: ").strip()
-
-        if choice == '1':
-            run_metrologia(cap)
-        elif choice == '2':
-            run_ocarina(cap)
-        elif choice == '3':
-            run_ar_hand(cap)
-        elif choice == '0':
-            break
+    hole_states = {}
+    active_holes = []
+    for hid in OCARINA_HOLE_IDS:
+        if hid in detected_ids:
+            _hole_absent[hid] = 0
+            hole_states[hid] = False
         else:
-            print("Opção inválida. Tente novamente.")
+            _hole_absent[hid] += 1
+            covered = _hole_absent[hid] >= _ABSENT_THRESHOLD
+            hole_states[hid] = covered
+            if covered:
+                last = _note_playing.get(hid, 0)
+                if now - last > _NOTE_COOLDOWN:
+                    _note_playing[hid] = now
+                    _sound_cache[hid].stop()
+                    _sound_cache[hid].play()
+            if covered:
+                active_holes.append(hid)
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Até logo!")
+    if ids is not None:
+        cv2.aruco.drawDetectedMarkers(out, corners, ids)
+
+    body_idx = None
+    if ids is not None:
+        idlist = ids.flatten().tolist()
+        if OCARINA_BODY_ID in idlist:
+            body_idx = idlist.index(OCARINA_BODY_ID)
+    if body_idx is not None:
+        rvec,tvec = _pose_from_corners([corners[body_idx]])
+        if tvec is not None:
+            _draw_ocarina_body(out, corners[body_idx], rvec, tvec, hole_states)
+
+    # Legenda buracos na imagem
+    legend_y = frame.shape[0]-30
+    for i, hid in enumerate(OCARINA_HOLE_IDS):
+        col = NOTE_COLORS_CV[hid]
+        x0 = 10+i*80
+        cv2.circle(out, (x0, legend_y), 7, col, -1)
+        put_text(out, f"{hid}={NOTE_NAMES[hid]}", (x0-4, legend_y+20),
+                 scale=0.35, color=col, bg=False)
+
+    if active_holes:
+        names = "  ".join(NOTE_NAMES[h] for h in active_holes)
+        put_text(out, f"Tocando: {names}", (10,30), scale=0.65, color=C_YEL)
+        app.set_status(f"🎵 {names}")
+        app.update_holes(active_holes)
+    else:
+        put_text(out, "Cubra os buracos (IDs 1–7) para tocar", (10,30),
+                 scale=0.55, color=C_YEL)
+        app.set_status("Aguardando cobertura de buraco…")
+        app.update_holes([])
+
+    return out
+
+# ══════════════════════════════════════════════
+# MODO 3 — AR SEM MARCADORES
+# ══════════════════════════════════════════════
+CUBE_EDGES = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),
+              (0,4),(1,5),(2,6),(3,7)]
+CUBE_FACES = [
+    ([0,1,2,3],(80,120,220)),([4,5,6,7],(60,200,120)),
+    ([0,1,5,4],(220,80,80)), ([3,2,6,7],(200,180,60)),
+    ([0,3,7,4],(180,60,200)),([1,2,6,5],(60,200,220)),
+]
+
+def _build_cube(center, size):
+    s = size/2
+    verts = np.array([
+        [-s,-s,-s],[s,-s,-s],[s,s,-s],[-s,s,-s],
+        [-s,-s,s],[s,-s,s],[s,s,s],[-s,s,s],
+    ], dtype=np.float32)
+    return verts + center
+
+def _project_point(pt3):
+    fx=CAM_MTX[0,0]; fy=CAM_MTX[1,1]; cx_=CAM_MTX[0,2]; cy_=CAM_MTX[1,2]
+    z=max(pt3[2],0.001)
+    return (int(fx*pt3[0]/z+cx_), int(fy*pt3[1]/z+cy_))
+
+def _draw_cube_on_frame(out, verts3d, alpha=0.6):
+    pts2d = np.array([_project_point(v) for v in verts3d])
+    h,w = out.shape[:2]
+    mask = (pts2d[:,0]>=0)&(pts2d[:,0]<w)&(pts2d[:,1]>=0)&(pts2d[:,1]<h)
+    if mask.sum() < 4:
+        return
+    overlay = out.copy()
+    face_depths = sorted(
+        [(np.mean([verts3d[i][2] for i in idxs]), fi)
+         for fi,(idxs,col) in enumerate(CUBE_FACES)], reverse=True)
+    for _, fi in face_depths:
+        idxs,col = CUBE_FACES[fi]
+        poly = pts2d[idxs]
+        if poly.shape[0] >= 3:
+            cv2.fillConvexPoly(overlay, poly, col)
+    cv2.addWeighted(overlay, alpha, out, 1-alpha, 0, out)
+    for i,j in CUBE_EDGES:
+        if mask[i] and mask[j]:
+            cv2.line(out, tuple(pts2d[i]), tuple(pts2d[j]), (255,255,255), 1, cv2.LINE_AA)
+
+def _estimate_palm_depth(lms, w, h):
+    p0 = np.array([lms[0].x*w, lms[0].y*h], dtype=np.float32)
+    p9 = np.array([lms[9].x*w, lms[9].y*h], dtype=np.float32)
+    px_dist = float(np.linalg.norm(p9-p0))
+    if px_dist < 1: return 0.5
+    f = (CAM_MTX[0,0]+CAM_MTX[1,1])/2
+    return 0.10 * f / px_dist
+
+def process_markerless(frame, app):
+    global _mp_frame_ts
+    h,w = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    _mp_frame_ts += 33
+    result = _hands_model.detect_for_video(mp_image, _mp_frame_ts)
+    out = frame.copy()
+
+    if result.hand_landmarks:
+        for hand_lm_list in result.hand_landmarks:
+            lms = hand_lm_list
+            for a,b in _HAND_CONNECTIONS:
+                cv2.line(out,
+                         (int(lms[a].x*w),int(lms[a].y*h)),
+                         (int(lms[b].x*w),int(lms[b].y*h)),
+                         (200,200,200),1,cv2.LINE_AA)
+            for lm in lms:
+                cv2.circle(out,(int(lm.x*w),int(lm.y*h)),3,(80,200,255),-1)
+
+            palm_ids=[0,5,9,13,17]
+            px = np.mean([lms[i].x for i in palm_ids])*w
+            py = np.mean([lms[i].y for i in palm_ids])*h
+            depth = _estimate_palm_depth(lms,w,h)
+            fx=CAM_MTX[0,0]; fy=CAM_MTX[1,1]
+            cx_c=CAM_MTX[0,2]; cy_c=CAM_MTX[1,2]
+            X=(px-cx_c)*depth/fx; Y=(py-cy_c)*depth/fy
+            palm_3d = np.array([X,Y,depth], dtype=np.float32)
+            _draw_cube_on_frame(out, _build_cube(palm_3d, 0.06))
+            cv2.circle(out,(int(px),int(py)),8,C_YEL,-1)
+            put_text(out,f"Z~{depth*100:.0f}cm",(int(px)+12,int(py)),
+                     scale=0.5,color=C_YEL)
+            app.set_status(f"✋ Mão detectada | dist ~{depth*100:.0f} cm")
+    else:
+        put_text(out,"Mostre a palma da mão à câmera",(10,30),
+                 scale=0.6,color=C_YEL)
+        app.set_status("Aguardando mão…")
+
+    return out
+
+# ══════════════════════════════════════════════
+# INTERFACE TKINTER
+# ══════════════════════════════════════════════
+
+DARK    = "#0e0e12"
+PANEL   = "#1a1a24"
+ACCENT  = "#4f8ef7"
+ACCENT2 = "#a259ff"
+TEXT_W  = "#e8e8f0"
+TEXT_DIM= "#6b6b80"
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Visão Computacional — TP2")
+        self.configure(bg=DARK)
+        self.resizable(False, False)
+
+        self.mode = tk.IntVar(value=1)
+        self._running = True
+        self._active_holes: list = []
+
+        self._build_ui()
+
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        self.bind("<KeyPress>", self._on_key)
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self._update()
+
+    # ── Layout ────────────────────────────────
+    def _build_ui(self):
+        # ---- Header ----
+        header = tk.Frame(self, bg=PANEL, pady=8)
+        header.pack(fill="x")
+        tk.Label(header, text="👁  VISÃO COMPUTACIONAL",
+                 font=("Courier New", 14, "bold"),
+                 fg=ACCENT, bg=PANEL).pack(side="left", padx=14)
+        tk.Label(header, text="TP2",
+                 font=("Courier New", 10),
+                 fg=ACCENT2, bg=PANEL).pack(side="left")
+        tk.Label(header, text=CALIB_STATUS,
+                 font=("Courier New", 9),
+                 fg="#55cc88" if "carregada" in CALIB_STATUS else "#ffaa33",
+                 bg=PANEL).pack(side="right", padx=14)
+
+        # ---- Main row ----
+        main = tk.Frame(self, bg=DARK)
+        main.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # Camera canvas
+        self.canvas = tk.Canvas(main, width=640, height=480,
+                                bg="#000", highlightthickness=0)
+        self.canvas.pack(side="left")
+
+        # Side panel
+        side = tk.Frame(main, bg=PANEL, width=220)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+
+        tk.Label(side, text="MODO", font=("Courier New", 9, "bold"),
+                 fg=TEXT_DIM, bg=PANEL).pack(pady=(18,4))
+
+        modes = [
+            (1, "📏 Metrologia",  "Mede distância\nentre marcadores"),
+            (2, "🎵 Ocarina",     "Toca notas ao\ncolocar dedos"),
+            (3, "✋ AR Palma",    "Objeto 3D sobre\na palma da mão"),
+        ]
+        self._mode_btns = {}
+        for val, label, tip in modes:
+            f = tk.Frame(side, bg=PANEL)
+            f.pack(fill="x", padx=10, pady=4)
+            btn = tk.Button(
+                f, text=label,
+                font=("Courier New", 10, "bold"),
+                fg=TEXT_W, bg="#252535",
+                activebackground=ACCENT, activeforeground="#fff",
+                relief="flat", cursor="hand2", pady=8,
+                command=lambda v=val: self._set_mode(v)
+            )
+            btn.pack(fill="x")
+            tk.Label(f, text=tip, font=("Courier New", 7),
+                     fg=TEXT_DIM, bg=PANEL, justify="left").pack(anchor="w", padx=4)
+            self._mode_btns[val] = btn
+
+        # Separator
+        tk.Frame(side, bg="#2a2a3a", height=1).pack(fill="x", padx=10, pady=10)
+
+        # Status
+        tk.Label(side, text="STATUS", font=("Courier New", 9, "bold"),
+                 fg=TEXT_DIM, bg=PANEL).pack()
+        self._status_var = tk.StringVar(value="Iniciando…")
+        tk.Label(side, textvariable=self._status_var,
+                 font=("Courier New", 9), fg=TEXT_W, bg=PANEL,
+                 wraplength=190, justify="left").pack(padx=10, pady=6)
+
+        # Separator
+        tk.Frame(side, bg="#2a2a3a", height=1).pack(fill="x", padx=10, pady=10)
+
+        # Ocarina note display
+        tk.Label(side, text="NOTAS", font=("Courier New", 9, "bold"),
+                 fg=TEXT_DIM, bg=PANEL).pack()
+        self._note_frame = tk.Frame(side, bg=PANEL)
+        self._note_frame.pack(pady=6, padx=8, fill="x")
+        self._note_labels: dict[int, tk.Label] = {}
+        for i, (hid, name) in enumerate(NOTE_NAMES.items()):
+            col = NOTE_COLORS_HEX[hid]
+            lbl = tk.Label(self._note_frame, text=f" {name} ",
+                           font=("Courier New", 9, "bold"),
+                           fg="#222", bg="#333",
+                           relief="flat", padx=4, pady=2)
+            lbl.grid(row=i//4, column=i%4, padx=2, pady=2, sticky="ew")
+            self._note_labels[hid] = lbl
+
+        # Spacer + keys legend
+        tk.Frame(side, bg=PANEL).pack(expand=True, fill="y")
+        tk.Frame(side, bg="#2a2a3a", height=1).pack(fill="x", padx=10, pady=4)
+        keys_info = "1 / 2 / 3 — trocar modo\nQ  /  Esc — sair"
+        tk.Label(side, text=keys_info, font=("Courier New", 8),
+                 fg=TEXT_DIM, bg=PANEL, justify="left").pack(padx=10, pady=(0,14))
+
+        # Quit button
+        tk.Button(side, text="⏹  SAIR",
+                  font=("Courier New", 9, "bold"),
+                  fg="#ff6060", bg="#1a1a24",
+                  activebackground="#ff6060", activeforeground="#fff",
+                  relief="flat", cursor="hand2", pady=6,
+                  command=self.quit_app).pack(fill="x", padx=10, pady=(0,12))
+
+        self._refresh_mode_buttons()
+
+    # ── Helpers ───────────────────────────────
+    def _set_mode(self, val):
+        self.mode.set(val)
+        if val == 1:
+            _metro_history.clear()
+        self.update_holes([])
+        self._refresh_mode_buttons()
+
+    def _refresh_mode_buttons(self):
+        cur = self.mode.get()
+        for val, btn in self._mode_btns.items():
+            if val == cur:
+                btn.config(bg=ACCENT, fg="#fff")
+            else:
+                btn.config(bg="#252535", fg=TEXT_W)
+
+    def set_status(self, text: str):
+        self._status_var.set(text)
+
+    def update_holes(self, active: list):
+        self._active_holes = active
+        for hid, lbl in self._note_labels.items():
+            if hid in active:
+                lbl.config(bg=NOTE_COLORS_HEX[hid], fg="#111")
+            else:
+                lbl.config(bg="#333", fg="#555")
+
+    def _on_key(self, event):
+        k = event.keysym.lower()
+        if k in ("q", "escape"):
+            self.quit_app()
+        elif k == "1":
+            self._set_mode(1)
+        elif k == "2":
+            self._set_mode(2)
+        elif k == "3":
+            self._set_mode(3)
+
+    # ── Camera loop ───────────────────────────
+    def _update(self):
+        if not self._running:
+            return
+        ret, frame = self.cap.read()
+        if ret:
+            mode = self.mode.get()
+            processors = {1: process_metrology, 2: process_ocarina, 3: process_markerless}
+            out = processors[mode](frame, self)
+
+            # Convert BGR → RGB → PIL → ImageTk
+            img_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(img_rgb)
+            self._imgtk = ImageTk.PhotoImage(image=img_pil)
+            self.canvas.create_image(0, 0, anchor="nw", image=self._imgtk)
+
+        self.after(16, self._update)   # ~60 fps target
+
+    def quit_app(self):
+        self._running = False
+        self.cap.release()
+        pygame.mixer.quit()
+        self.destroy()
 
 
-if __name__ == '__main__':
-    main()
+# ══════════════════════════════════════════════
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
