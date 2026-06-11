@@ -1,0 +1,158 @@
+
+╔══════════════════════════════════════════════════════════════════════╗
+║       RELATÓRIO – 3º TRABALHO PRÁTICO DE VISÃO COMPUTACIONAL        ║
+║       UNICENTRO / DECOMP – Prof. Dr. Mauro Miazaki                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PRÉ-PROCESSAMENTO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Carregamento:
+  As imagens foram carregadas diretamente dos arquivos ZIP (b0207.zip e
+  b0309.zip), sem extração em disco. Cada arquivo contém uma sequência de
+  fatias PNG em escala de cinza representando cortes tomográficos das raízes.
+  As fatias foram ordenadas lexicograficamente e empilhadas em um volume
+  tridimensional NumPy de formato (Z, Y, X).
+
+Dimensões dos volumes:
+  • b0207: 490 × 400 × 250 voxels  (49.00 Mvoxels)
+  • b0309: 400 × 340 × 250 voxels  (34.00 Mvoxels)
+
+Limpeza de bordas (border cleaning):
+  Os 5 pixels das bordas externas nas direções X e Y, bem como as
+  5 primeiras e últimas fatias na direção Z, foram zerados.
+  Essa operação elimina artefatos típicos de escâneres (reflexões de borda,
+  ruído de truncamento e gradientes artificiais) que, caso mantidos, seriam
+  incluídos erroneamente na isosuperfície e no esqueleto, comprometendo as
+  métricas. A limpeza é realizada antes de qualquer normalização.
+
+  Após a limpeza, os volumes foram normalizados para o intervalo [0, 1]
+  (divisão pelo valor máximo) e convertidos para o formato pv.ImageData
+  do PyVista, com os escalares armazenados como ponto flutuante de 32 bits.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. VISUALIZAÇÕES GERADAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+a) DVR – Direct Volume Rendering:
+   Renderização volumétrica direta usando a função add_volume() do PyVista.
+   Uma tabela de transferência de opacidade torna o fundo (intensidades
+   baixas) completamente transparente e as regiões densas da raiz com alta
+   opacidade. O colormap "bone" realça a estrutura radicular em tons claros
+   sobre o fundo preto. Parâmetros de iluminação: diffuse=0.6, specular=0.3,
+   ambient=0.3.
+
+b) Isosuperfície (suavização e decimação):
+   • Geração: Marching Cubes via pyvista .contour() com isovalor = 0.50.
+   • Suavização: filtro Laplaciano (50 iterações, fator de
+     relaxação 0.1, suavização de borda ativada). Remove o efeito de
+     "escada" dos voxels.
+   • Decimação: redução de 70% das faces via pyvista .decimate(),
+     mantendo a forma geral da raiz com menor custo computacional.
+
+c) Esqueleto 3D + visualização combinada:
+   • Binarização: limiarização de Otsu aplicada apenas nos pixels não-nulos
+     para evitar viés do fundo preto.
+   • Limpeza: remoção de objetos com menos de 64 voxels e fechamento
+     morfológico com bola de raio 1 (preenchimento de pequenos buracos).
+   • Skeletonize: skeletonize_3d() do scikit-image (algoritmo de afinamento
+     topológico 3D, preserva a conectividade).
+   • Conversão para linhas: os voxels do esqueleto são conectados com seus
+     vizinhos 26-conectados para gerar células de linha em pv.PolyData.
+   • Visualização: isosuperfície semi-transparente (opacidade 0.30) com o
+     esqueleto sobreposto em azul como tubos de linha.
+
+d) Métricas: ver seção 3.
+
+e) Janela dividida e sincronizada:
+   Duas subjanelas lado a lado usando pv.Plotter(shape=(1,2)):
+   • Esquerda: DVR com a mesma tabela de transferência de opacidade.
+   • Direita: Isosuperfície suavizada e decimada.
+   As câmeras são sincronizadas via plotter.link_views(): qualquer rotação,
+   zoom ou translação aplicados em uma subjanela refletem imediatamente
+   na outra.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. MÉTRICAS OBTIDAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                              b0207              b0309
+  ────────────────────────────────────────────────────────────────
+  Volume (voxels)            42974517           30474434
+  Área superfície           855508.76          638520.92
+  Compacidade                0.333581           0.403458
+  Excentricidade               0.8580             0.7867
+  ────────────────────────────────────────────────────────────────
+  Skel – voxels                 62023             234827
+  Skel – ramos                  38172             227961
+  Skel – pontas                   461                121
+  Skel – densidade             0.0014             0.0077
+  Skel – alongament.             2.06               1.51
+  Skel – tortuosid.             93.93             457.99
+  Skel – segmentos               1278                245
+
+Definições das métricas:
+  • Volume: número de voxels classificados como raiz após binarização Otsu.
+  • Área de superfície: soma das áreas das faces triangulares da malha
+    decimada (mesh.area do PyVista).
+  • Compacidade: (36π·V²)/A³ – vale 1 para uma esfera perfeita; quanto
+    menor, mais irregular é a forma.
+  • Excentricidade: calculada via autovalores da matriz de covariância dos
+    voxels. Varia de 0 (esfera) a 1 (bastão).
+  • Skel – voxels: comprimento total do esqueleto em voxels.
+  • Skel – ramos: voxels com ≥ 3 vizinhos no esqueleto (pontos de
+    bifurcação), indicam complexidade da ramificação.
+  • Skel – pontas: voxels com exatamente 1 vizinho, indicam extremidades.
+  • Skel – densidade: razão voxels_esqueleto / voxels_binários.
+  • Skel – alongamento: dimensão_máxima / dimensão_mínima do bounding box.
+  • Skel – tortuosidade: comprimento_skel / diagonal_bounding_box. Valores
+    maiores indicam trajetórias mais sinuosas.
+  • Skel – segmentos: número de componentes conexos após remover os pontos
+    de ramificação (estimativa do número de ramos individuais).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. COMPARAÇÃO E ANÁLISE DAS DUAS RAÍZES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  • Volume (voxels)           : b0207=42974517 vox  b0309=30474434 vox  → b0207 é 41.0% maior
+  • Área superfície           : b0207=855508.76 unid²  b0309=638520.92 unid²  → b0207 é 34.0% maior
+  • Compacidade               : b0207=0.333581  b0309=0.403458  → b0309 é 17.3% maior
+  • Excentricidade            : b0207=0.8580  b0309=0.7867  → b0207 é 9.1% maior
+  • Skel – voxels             : b0207=62023  b0309=234827  → b0309 é 73.6% maior
+  • Skel – ramos              : b0207=38172  b0309=227961  → b0309 é 83.3% maior
+  • Skel – pontas             : b0207=461  b0309=121  → b0207 é 281.0% maior
+  • Skel – densidade          : b0207=0.0014  b0309=0.0077  → b0309 é 81.3% maior
+  • Skel – alongamento        : b0207=2.06  b0309=1.51  → b0207 é 36.8% maior
+  • Skel – tortuosidade       : b0207=93.93  b0309=457.99  → b0309 é 79.5% maior
+  • Skel – segmentos          : b0207=1278  b0309=245  → b0207 é 421.6% maior
+
+  ── Interpretação qualitativa ──
+  → Volume: b0207 possui volume consideravelmente maior, indicando
+    uma raiz com mais massa de tecido ou diâmetro médio superior.
+  → Ramificação: b0309 tem mais pontos de bifurcação (maior
+    complexidade topológica).
+  → Forma: b0207 é mais alongada (estrutura mais linear/vertical).
+  → Tortuosidade: b0309 possui trajetórias mais sinuosas.
+  → Compacidade: b0309 é mais compacta (morfologia mais globosa).
+  → Excentricidade: b0207 tem distribuição de massa mais assimétrica.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. METODOLOGIA TÉCNICA RESUMIDA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Linguagem    : Python 3
+  Interface    : tkinter (GUI nativa, tema "clam" customizado)
+  Visualização : PyVista (renderização 3D interativa, VTK backend)
+  Processamento: scikit-image (Otsu, morfologia, skeletonize_3d),
+                 scipy.ndimage (convolução, label), NumPy, Pillow
+
+  Pipeline completo:
+    ZIP ──► PIL (grayscale) ──► ndarray (Z,Y,X) uint8
+        ──► limpeza de bordas (border=5px)
+        ──► normalização [0,1] ──► pv.ImageData
+        ──► isosuperfície (Marching Cubes)
+        ──► suavização Laplaciana ──► decimação
+        ──► binarização Otsu ──► limpeza morfológica
+        ──► skeletonize_3d ──► linhas PyVista
+        ──► cálculo de métricas
